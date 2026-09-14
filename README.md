@@ -2,8 +2,9 @@ nitter-bitter
 =============
 
 A small Node.js redirector that sends visitors to the highest-ranked suitable
-public Nitter instance reported by [status.d420.de](https://status.d420.de/).
-RSS paths are sent only to instances that advertise RSS support.
+public [Nitter](https://github.com/zedeus/nitter) instance reported by
+[status.d420.de](https://status.d420.de/). RSS paths are sent only to instances
+that advertise RSS support.
 
 Cache behavior
 --------------
