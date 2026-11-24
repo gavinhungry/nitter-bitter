@@ -40,6 +40,16 @@ Configuration
 - `EXCLUDE_HOSTS` is a comma-separated list of instance hostnames that are
   never used, matched case-insensitively, e.g.
   `EXCLUDE_HOSTS=nitter.example.com,xcancel.com`. Changes require a restart.
+- `EXCLUDE_COUNTRIES` is a comma-separated list of
+  [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2#Officially_assigned_code_elements)
+  country codes, matched case-insensitively, e.g.
+  `EXCLUDE_COUNTRIES=IL,KP,IR,SV,RU`. Instances the status API places in any
+  listed country are never used, even if no other instance is available. An
+  instance listed in several countries is excluded if any of them match.
+  `UN` matches instances without a single country (e.g. anycast hosting), and
+  instances with no country information are kept. Countries reflect hosting
+  location as reported by the status API. Invalid entries are logged and
+  ignored. Changes require a restart.
 - `CLIENT_PROBE=1` (or `true`) enables browser-side instance selection. It is
   off by default.
 

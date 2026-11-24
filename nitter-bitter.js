@@ -12,6 +12,7 @@ const DEFAULT_MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
 const DEFAULT_FETCH_TIMEOUT_MS = 10 * 1000;
 const DEFAULT_HEALTH_FETCH_TIMEOUT_MS = 5 * 1000;
 const DEFAULT_EXCLUDE_HOSTS = (process.env.EXCLUDE_HOSTS || '').split(',');
+const DEFAULT_EXCLUDE_COUNTRIES = (process.env.EXCLUDE_COUNTRIES || '').split(',');
 const DEFAULT_CLIENT_PROBE = /^(1|true)$/i.test((process.env.CLIENT_PROBE || '').trim());
 const HEALTH_PROBE_BATCH_SIZE = 3;
 const MAX_HEALTH_PROBES = 8;
@@ -82,6 +83,48 @@ const normalizeExcludedHosts = hosts =>
   new Set(
     hosts.map(host => String(host).trim().toLowerCase()).filter(Boolean),
   );
+
+const normalizeExcludedCountries = (countries, logger) => {
+  const codes = new Set();
+  for (const country of countries) {
+    const code = String(country).trim().toUpperCase();
+    if (!code) continue;
+    if (/^[A-Z]{2}$/.test(code)) {
+      codes.add(code);
+    } else {
+      logger.warn(
+        `Ignoring invalid EXCLUDE_COUNTRIES entry "${code}"; expected a two-letter ISO 3166-1 code`,
+      );
+    }
+  }
+  return codes;
+};
+
+const REGIONAL_INDICATOR_A = 0x1f1e6;
+const REGIONAL_INDICATOR_Z = 0x1f1ff;
+
+// The status API reports countries as flag emoji, each a pair of regional
+// indicator symbols spelling an ISO 3166-1 alpha-2 code. Some hosts have several.
+const countryCodesFor = host => {
+  const codes = [];
+  let pending = '';
+  for (const char of typeof host?.country === 'string' ? host.country : '') {
+    const codePoint = char.codePointAt(0);
+    if (codePoint < REGIONAL_INDICATOR_A || codePoint > REGIONAL_INDICATOR_Z) {
+      pending = '';
+      continue;
+    }
+    pending += String.fromCharCode(codePoint - REGIONAL_INDICATOR_A + 65);
+    if (pending.length === 2) {
+      codes.push(pending);
+      pending = '';
+    }
+  }
+  return codes;
+};
+
+const isExcludedCountry = (host, excludedCountries) =>
+  countryCodesFor(host).some(code => excludedCountries.has(code));
 
 const isOutdated = host => host?.version_state === 'Outdated';
 
@@ -282,11 +325,13 @@ export const createProxy = ({
   fetchTimeoutMs = DEFAULT_FETCH_TIMEOUT_MS,
   healthFetchTimeoutMs = DEFAULT_HEALTH_FETCH_TIMEOUT_MS,
   excludeHosts = DEFAULT_EXCLUDE_HOSTS,
+  excludeCountries = DEFAULT_EXCLUDE_COUNTRIES,
   clientProbe = DEFAULT_CLIENT_PROBE,
   now = Date.now,
   logger = console,
 } = {}) => {
   const excludedHosts = normalizeExcludedHosts(excludeHosts);
+  const excludedCountries = normalizeExcludedCountries(excludeCountries, logger);
   let snapshot = null;
   let retryAfter = 0;
   let refreshPromise = null;
@@ -321,7 +366,10 @@ export const createProxy = ({
         }
 
         const candidates = payload.hosts.filter(
-          host => !isExcluded(host, excludedHosts) && !isOutdated(host),
+          host =>
+            !isExcluded(host, excludedHosts) &&
+            !isExcludedCountry(host, excludedCountries) &&
+            !isOutdated(host),
         );
 
         const probe = async host => {
