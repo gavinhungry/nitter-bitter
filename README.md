@@ -37,6 +37,26 @@ Configuration
 - `EXCLUDE_HOSTS` is a comma-separated list of instance hostnames that are
   never used, matched case-insensitively, e.g.
   `EXCLUDE_HOSTS=nitter.example.com,xcancel.com`. Changes require a restart.
+- `CLIENT_PROBE=1` (or `true`) enables browser-side instance selection. It is
+  off by default.
+
+Browser-side selection
+----------------------
+
+When `CLIENT_PROBE` is enabled, requests that accept `text/html` and do not end
+in `/rss` receive a small blank page instead of a redirect. The page contains
+up to eight ranked web instances, with excluded and server-unreachable
+instances removed. Its script probes them from the visitor's own network, in
+parallel batches of three with a 2.5-second timeout, and navigates to the
+highest-ranked instance that answers. This catches instances that are
+unreachable from a visitor's network even when the server can reach them.
+
+- The probes are `no-cors` requests to each instance's `/.health`; any HTTP
+  response counts as reachable.
+- Nothing is stored in the browser, so every visit probes again.
+- Without JavaScript, the page redirects to the server's top pick.
+- If no instance answers, the page lists links to all candidates.
+- RSS paths and other clients (feed readers, `curl`) always get the redirect.
 
 Health endpoint
 ---------------
@@ -51,7 +71,8 @@ stale cache refresh. The JSON body contains:
 - `cached`: whether the instance list has ever been fetched.
 - `lastUpdate`: the status API's last update time, or `null`.
 - `upstream.web` and `upstream.rss`: the instances that web and RSS requests
-  are currently sent to, or `null` if there is none.
+  are currently sent to, or `null` if there is none. With `CLIENT_PROBE`,
+  `upstream.web` is the server's top pick; a browser may choose another.
 
 Run the tests with `node --test`.
 
