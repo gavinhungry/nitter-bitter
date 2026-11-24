@@ -24,7 +24,8 @@ Cache behavior
 - There is no refresh timer. The first request after expiry waits for a refresh.
 - Concurrent requests share the same in-flight API request.
 - If a refresh fails, stale data remains available and another attempt is
-  suppressed for 5 minutes.
+  suppressed for 5 minutes. If the status API responds with HTTP 429 or 503
+  and a longer `Retry-After`, that is honored instead, up to one hour.
 - If no cache has ever been populated, an API failure results in HTTP 503.
 
 The status API itself updates every 15 minutes. Public Nitter instances should

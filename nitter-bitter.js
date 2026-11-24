@@ -8,6 +8,7 @@ const PORT = Number.parseInt(process.env.PORT || '17331', 10);
 const DEFAULT_STATUS_API_URL = 'https://status.d420.de/api/v1/instances';
 const DEFAULT_CACHE_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_RETRY_DELAY_MS = 5 * 60 * 1000;
+const DEFAULT_MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
 const DEFAULT_FETCH_TIMEOUT_MS = 10 * 1000;
 const DEFAULT_HEALTH_FETCH_TIMEOUT_MS = 5 * 1000;
 const DEFAULT_EXCLUDE_HOSTS = (process.env.EXCLUDE_HOSTS || '').split(',');
@@ -85,6 +86,16 @@ const normalizeExcludedHosts = hosts =>
 const isExcluded = (host, excludedHosts) => {
   const url = instanceUrlFor(host);
   return url !== null && excludedHosts.has(url.hostname);
+};
+
+// Accepts delta-seconds or an HTTP date. Returns null when absent or invalid.
+const retryAfterMsFor = (value, currentTime) => {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+
+  const date = Date.parse(trimmed);
+  return Number.isFinite(date) ? Math.max(0, date - currentTime) : null;
 };
 
 const healthFactorFor = payload => {
@@ -265,6 +276,7 @@ export const createProxy = ({
   statusApiUrl = DEFAULT_STATUS_API_URL,
   cacheTtlMs = DEFAULT_CACHE_TTL_MS,
   retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+  maxRetryAfterMs = DEFAULT_MAX_RETRY_AFTER_MS,
   fetchTimeoutMs = DEFAULT_FETCH_TIMEOUT_MS,
   healthFetchTimeoutMs = DEFAULT_HEALTH_FETCH_TIMEOUT_MS,
   excludeHosts = DEFAULT_EXCLUDE_HOSTS,
@@ -291,7 +303,14 @@ export const createProxy = ({
         });
 
         if (!response.ok) {
-          throw new Error(`status API returned HTTP ${response.status}`);
+          const error = new Error(`status API returned HTTP ${response.status}`);
+          if (response.status === 429 || response.status === 503) {
+            error.retryAfterMs = retryAfterMsFor(
+              response.headers.get('retry-after'),
+              now(),
+            );
+          }
+          throw error;
         }
 
         const payload = await response.json();
@@ -377,8 +396,16 @@ export const createProxy = ({
         retryAfter = 0;
         return snapshot;
       } catch (error) {
-        retryAfter = now() + retryDelayMs;
-        logger.error('Failed to refresh Nitter instance cache:', error);
+        // Never retry sooner than usual; honor longer upstream requests up to a cap.
+        const delayMs = Math.max(
+          retryDelayMs,
+          Math.min(error.retryAfterMs ?? 0, maxRetryAfterMs),
+        );
+        retryAfter = now() + delayMs;
+        logger.error(
+          `Failed to refresh Nitter instance cache (retrying in ${Math.ceil(delayMs / 1000)}s):`,
+          error,
+        );
         throw error;
       } finally {
         refreshPromise = null;
