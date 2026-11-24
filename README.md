@@ -12,6 +12,8 @@ Cache behavior
 - The cache exists only in process memory; the service never writes it to disk.
 - A one-off status API request starts when the process starts.
 - Cached data is fresh for 15 minutes.
+- Instances the status API marks as outdated (`version_state` of `Outdated`)
+  are always excluded, even if no other instance is available.
 - Each successful status refresh probes instance `/.health` endpoints in
   ranked order, in parallel batches of up to three, until it finds a reachable
   web candidate and a reachable RSS candidate. At most eight instances are

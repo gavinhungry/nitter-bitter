@@ -83,6 +83,8 @@ const normalizeExcludedHosts = hosts =>
     hosts.map(host => String(host).trim().toLowerCase()).filter(Boolean),
   );
 
+const isOutdated = host => host?.version_state === 'Outdated';
+
 const isExcluded = (host, excludedHosts) => {
   const url = instanceUrlFor(host);
   return url !== null && excludedHosts.has(url.hostname);
@@ -319,7 +321,7 @@ export const createProxy = ({
         }
 
         const candidates = payload.hosts.filter(
-          host => !isExcluded(host, excludedHosts),
+          host => !isExcluded(host, excludedHosts) && !isOutdated(host),
         );
 
         const probe = async host => {
