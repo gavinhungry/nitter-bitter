@@ -9,8 +9,13 @@ const DEFAULT_CACHE_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_RETRY_DELAY_MS = 5 * 60 * 1000;
 const DEFAULT_FETCH_TIMEOUT_MS = 10 * 1000;
 const DEFAULT_HEALTH_FETCH_TIMEOUT_MS = 5 * 1000;
-const MAX_HEALTH_PROBES = 3;
+const DEFAULT_EXCLUDE_HOSTS = (process.env.EXCLUDE_HOSTS || '').split(',');
+const HEALTH_PROBE_BATCH_SIZE = 3;
+const MAX_HEALTH_PROBES = 8;
 const HEALTH_FACTOR = Symbol('healthFactor');
+const PROBE_RESULT = Symbol('probeResult');
+const REACHABLE = 'reachable';
+const UNREACHABLE = 'unreachable';
 
 const instanceUrlFor = host => {
   try {
@@ -37,12 +42,13 @@ const isSuitable = (host, needsRss) =>
   host.is_bad_host !== true &&
   (!needsRss || host.rss === true);
 
-const instanceFor = (hosts, needsRss) => {
+const bestInstance = (hosts, needsRss, allowUnreachable) => {
   let best = null;
   let bestScore = Number.NEGATIVE_INFINITY;
 
   for (const host of hosts) {
     if (!isSuitable(host, needsRss)) continue;
+    if (!allowUnreachable && host[PROBE_RESULT] === UNREACHABLE) continue;
 
     const url = instanceUrlFor(host);
     if (!url) continue;
@@ -56,6 +62,23 @@ const instanceFor = (hosts, needsRss) => {
   }
 
   return best;
+};
+
+// If every suitable instance failed its probe, fall back to ranking them anyway.
+const instanceFor = (hosts, needsRss) =>
+  bestInstance(hosts, needsRss, false) ?? bestInstance(hosts, needsRss, true);
+
+const hasReachableInstance = hosts =>
+  hosts.some(host => isSuitable(host, false) && host[PROBE_RESULT] === REACHABLE);
+
+const normalizeExcludedHosts = hosts =>
+  new Set(
+    hosts.map(host => String(host).trim().toLowerCase()).filter(Boolean),
+  );
+
+const isExcluded = (host, excludedHosts) => {
+  const url = instanceUrlFor(host);
+  return url !== null && excludedHosts.has(url.hostname);
 };
 
 const healthFactorFor = payload => {
@@ -87,23 +110,26 @@ const healthFactorFor = payload => {
   return null;
 };
 
-const healthProbeCandidates = hosts => {
-  const candidates = [];
+const nextProbeBatch = (hosts, probed, needsWeb, needsRss, limit) => {
+  const batch = [];
+  const isCandidate = (host, needsRssSupport) =>
+    !probed.has(host) &&
+    !batch.includes(host) &&
+    isSuitable(host, needsRssSupport) &&
+    instanceUrlFor(host) !== null;
   const add = host => {
-    if (host && !candidates.includes(host) && instanceUrlFor(host)) {
-      candidates.push(host);
-    }
+    if (host && batch.length < limit) batch.push(host);
   };
 
-  add(hosts.find(host => isSuitable(host, false)));
-  add(hosts.find(host => isSuitable(host, true)));
+  if (needsWeb) add(hosts.find(host => isCandidate(host, false)));
+  if (needsRss) add(hosts.find(host => isCandidate(host, true)));
 
   for (const host of hosts) {
-    if (candidates.length >= MAX_HEALTH_PROBES) break;
-    if (isSuitable(host, false)) add(host);
+    if (batch.length >= limit) break;
+    if (isCandidate(host, !needsWeb)) add(host);
   }
 
-  return candidates.slice(0, MAX_HEALTH_PROBES);
+  return batch;
 };
 
 const sendText = (response, statusCode, body, headers = {}) => {
@@ -122,9 +148,11 @@ export const createProxy = ({
   retryDelayMs = DEFAULT_RETRY_DELAY_MS,
   fetchTimeoutMs = DEFAULT_FETCH_TIMEOUT_MS,
   healthFetchTimeoutMs = DEFAULT_HEALTH_FETCH_TIMEOUT_MS,
+  excludeHosts = DEFAULT_EXCLUDE_HOSTS,
   now = Date.now,
   logger = console,
 } = {}) => {
+  const excludedHosts = normalizeExcludedHosts(excludeHosts);
   let snapshot = null;
   let retryAfter = 0;
   let refreshPromise = null;
@@ -151,32 +179,73 @@ export const createProxy = ({
           throw new Error('status API response does not contain a hosts array');
         }
 
-        const factors = new Map();
-        await Promise.all(
-          healthProbeCandidates(payload.hosts).map(async host => {
-            try {
-              const healthUrl = new URL('/.health', instanceUrlFor(host));
-              const healthResponse = await fetchImpl(healthUrl, {
+        const candidates = payload.hosts.filter(
+          host => !isExcluded(host, excludedHosts),
+        );
+
+        const probe = async host => {
+          let healthResponse;
+          try {
+            healthResponse = await fetchImpl(
+              new URL('/.health', instanceUrlFor(host)),
+              {
                 headers: {
                   Accept: 'application/json',
                   'User-Agent': 'nitter-bitter/1.0',
                 },
                 signal: AbortSignal.timeout(healthFetchTimeoutMs),
-              });
-              if (!healthResponse.ok) return;
+              },
+            );
+          } catch {
+            // Timeouts, refused connections, and DNS or TLS failures.
+            return { result: UNREACHABLE };
+          }
 
-              const factor = healthFactorFor(await healthResponse.json());
-              if (factor !== null) factors.set(host, factor);
-            } catch {
-              // Instances without an accessible health endpoint remain unpenalized.
-            }
-          }),
-        );
+          try {
+            if (!healthResponse.ok) return { result: REACHABLE };
+            const factor = healthFactorFor(await healthResponse.json());
+            return { result: REACHABLE, factor };
+          } catch {
+            // Instances without an accessible health endpoint remain unpenalized.
+            return { result: REACHABLE };
+          }
+        };
 
-        const hosts = payload.hosts.map(host => {
-          const factor = factors.get(host);
-          if (factor === undefined) return host;
-          return { ...host, [HEALTH_FACTOR]: factor };
+        const probes = new Map();
+        const hasProbedReachable = needsRss =>
+          [...probes].some(
+            ([host, { result }]) =>
+              result === REACHABLE && isSuitable(host, needsRss),
+          );
+
+        while (probes.size < MAX_HEALTH_PROBES) {
+          const needsWeb = !hasProbedReachable(false);
+          const needsRss = !hasProbedReachable(true);
+          if (!needsWeb && !needsRss) break;
+
+          const batch = nextProbeBatch(
+            candidates,
+            probes,
+            needsWeb,
+            needsRss,
+            Math.min(HEALTH_PROBE_BATCH_SIZE, MAX_HEALTH_PROBES - probes.size),
+          );
+          if (batch.length === 0) break;
+
+          const results = await Promise.all(batch.map(probe));
+          batch.forEach((host, index) => probes.set(host, results[index]));
+        }
+
+        const hosts = candidates.map(host => {
+          const probeResult = probes.get(host);
+          if (!probeResult) return host;
+          return {
+            ...host,
+            [PROBE_RESULT]: probeResult.result,
+            ...(Number.isFinite(probeResult.factor) && {
+              [HEALTH_FACTOR]: probeResult.factor,
+            }),
+          };
         });
 
         snapshot = {
@@ -248,11 +317,18 @@ export const createProxy = ({
     const hosts = cache?.hosts ?? [];
 
     if (requestUrl.pathname === '/healthz') {
-      const ready = instanceFor(hosts, false) !== null;
+      const web = instanceFor(hosts, false);
+      const rss = instanceFor(hosts, true);
+      const ready = web !== null;
       const body = JSON.stringify({
         ready,
+        reachable: hasReachableInstance(hosts),
         cached: cache !== null,
         lastUpdate: cache?.lastUpdate ?? null,
+        upstream: {
+          web: web?.origin ?? null,
+          rss: rss?.origin ?? null,
+        },
       });
       response.writeHead(ready ? 200 : 503, {
         'Cache-Control': 'no-store',
